@@ -1,0 +1,198 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Vehicle Tracker</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.css">
+<style>
+  :root { --ink:#000; --mid:#555; --line:#cfcfcf; --bg:#fff; --wash:#f4f4f4; }
+  * { box-sizing:border-box; margin:0; }
+  html, body { height:100%; }
+  body { font:14px/1.45 system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
+         color:var(--ink); background:var(--bg); display:flex; flex-direction:column; }
+  header { display:flex; align-items:center; gap:16px; padding:0 16px; height:52px;
+           border-bottom:1px solid var(--ink); flex:none; }
+  header h1 { font-size:15px; font-weight:600; }
+  header .sp { flex:1; }
+  .badge { padding:3px 10px; border:1px solid var(--ink); font-weight:600; font-size:13px; }
+  .badge.live { background:var(--ink); color:#fff; }
+  .badge.stale { border-style:dashed; }
+  .badge.none, .badge.off { color:var(--mid); border-color:var(--mid); }
+  #conn { color:var(--mid); font-size:13px; }
+  main { flex:1; display:grid; grid-template-columns:1fr 400px; min-height:0; }
+  #map { height:100%; background:var(--wash); }
+  .leaflet-tile-pane { filter:grayscale(1) contrast(.92); }
+  aside { border-left:1px solid var(--ink); overflow:auto; }
+  section { padding:14px 16px; border-bottom:1px solid var(--line); }
+  h2 { font-size:13px; font-weight:600; margin-bottom:8px; }
+  dl { display:grid; grid-template-columns:1fr auto; row-gap:4px; }
+  dt { color:var(--mid); }
+  dd { text-align:right; font-variant-numeric:tabular-nums; }
+  table { width:100%; border-collapse:collapse; font-size:13px; font-variant-numeric:tabular-nums; }
+  th, td { text-align:left; padding:5px 6px 5px 0; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { font-weight:600; color:var(--mid); }
+  td.open { font-weight:600; }
+  .empty { color:var(--mid); padding:6px 0; }
+  .row { display:flex; gap:8px; }
+  button { font:inherit; background:var(--bg); color:var(--ink); border:1px solid var(--ink);
+           padding:5px 12px; cursor:pointer; }
+  button:hover { background:var(--ink); color:#fff; }
+  button:focus-visible { outline:2px solid var(--ink); outline-offset:2px; }
+  @media (max-width:800px) {
+    main { grid-template-columns:1fr; grid-template-rows:55vh auto; }
+    aside { border-left:0; border-top:1px solid var(--ink); }
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>Vehicle VH001</h1>
+  <span id="badge" class="badge none">NO DATA</span>
+  <span class="sp"></span>
+  <span id="conn">API: connecting</span>
+</header>
+<main>
+  <div id="map" aria-label="Vehicle map"></div>
+  <aside>
+    <section>
+      <h2>Position</h2>
+      <dl>
+        <dt>Last update (device, UTC)</dt><dd id="t_dev">-</dd>
+        <dt>Age since receipt</dt><dd id="t_age">-</dd>
+        <dt>Latitude</dt><dd id="lat">-</dd>
+        <dt>Longitude</dt><dd id="lon">-</dd>
+        <dt>Speed</dt><dd id="spd">-</dd>
+        <dt>Sequence / source</dt><dd id="seq">-</dd>
+        <dt>Latency (receipt - device)</dt><dd id="lag">-</dd>
+      </dl>
+    </section>
+    <section>
+      <h2>Detection (measured / threshold)</h2>
+      <dl>
+        <dt>Distance to route</dt><dd id="d_dist">-</dd>
+        <dt>Consecutive samples outside</dt><dd id="d_out">-</dd>
+        <dt>Stationary time</dt><dd id="d_stop">-</dd>
+        <dt>Stale timeout</dt><dd id="d_stale">-</dd>
+      </dl>
+    </section>
+    <section>
+      <h2>Alerts</h2>
+      <table>
+        <thead><tr><th>Type</th><th>Triggered</th><th>Value / limit</th><th>Closed</th></tr></thead>
+        <tbody id="alerts"></tbody>
+      </table>
+      <div id="noalerts" class="empty">No alerts recorded.</div>
+    </section>
+    <section>
+      <h2>Test run</h2>
+      <div class="row">
+        <button id="csv">Export CSV</button>
+        <button id="reset">Clear data</button>
+      </div>
+    </section>
+  </aside>
+</main>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script>
+const API = location.protocol === 'file:' ? 'http://127.0.0.1:8000' : '';
+const VID = 'VH001';
+const $ = id => document.getElementById(id);
+const hms = s => s ? s.slice(11, 19) : '-';
+let cfg = null, lastHist = [];
+
+const map = L.map('map').setView([13.086, 80.2745], 16);
+L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+  { maxZoom: 19, attribution: '&copy; OpenStreetMap contributors' }).addTo(map);
+const track = L.polyline([], { color: '#000', weight: 3 }).addTo(map);
+let marker = null;
+
+async function j(url, opt) {
+  const r = await fetch(API + url, opt);
+  if (!r.ok) throw new Error(r.status);
+  return r.json();
+}
+
+async function init() {
+  try {
+    const c = await j('/api/config');
+    cfg = c.thresholds;
+    L.polyline(c.route, { color: '#777', weight: 8, opacity: .5 }).addTo(map);
+    map.fitBounds(L.latLngBounds(c.route).pad(.3));
+    $('d_stale').textContent = cfg.stale_s + ' s';
+  } catch (e) { /* retried on next tick */ }
+}
+
+function setBadge(cls, text) { $('badge').className = 'badge ' + cls; $('badge').textContent = text; }
+
+function render(s, hist, alerts) {
+  if (s.state === 'no_data') { setBadge('none', 'NO DATA'); return; }
+  const p = s.latest, stale = s.state === 'stale';
+  setBadge(stale ? 'stale' : 'live', stale ? 'STALE' : 'LIVE');
+  $('t_dev').textContent = hms(p.timestamp_utc);
+  $('t_age').textContent = s.age_s + ' s';
+  $('lat').textContent = p.latitude.toFixed(5);
+  $('lon').textContent = p.longitude.toFixed(5);
+  $('spd').textContent = p.speed_kmh.toFixed(1) + ' km/h';
+  $('seq').textContent = p.sequence + ' / ' + p.source;
+  $('lag').textContent = s.latency_s + ' s';
+
+  const d = s.detector;
+  if (d && cfg) {
+    $('d_dist').textContent = d.dist_m + ' m / ' + cfg.corridor_m + ' m';
+    $('d_out').textContent = d.outside + ' / ' + cfg.persist_samples;
+    $('d_stop').textContent = d.stationary_s + ' s / ' + cfg.stop_duration_s + ' s';
+  }
+
+  const ll = [p.latitude, p.longitude];
+  if (!marker) marker = L.circleMarker(ll, { radius: 8, weight: 2, color: '#000', fillOpacity: 1 }).addTo(map);
+  marker.setLatLng(ll).setStyle({ fillColor: stale ? '#fff' : '#000' });
+  marker.bindTooltip((stale ? 'Last known, ' : '') + hms(p.timestamp_utc) + ' UTC');
+  if (!map.getBounds().contains(ll)) map.panTo(ll);
+  track.setLatLngs(hist.map(h => [h.latitude, h.longitude]));
+  lastHist = hist;
+
+  $('alerts').innerHTML = alerts.map(a => `<tr>
+    <td class="${a.closed_utc ? '' : 'open'}">${a.type === 'stop' ? 'Stop' : 'Deviation'}</td>
+    <td>${hms(a.trigger_utc)}</td>
+    <td>${a.observed} / ${a.threshold}${a.type === 'stop' ? ' s' : ' m'}</td>
+    <td>${a.closed_utc ? hms(a.closed_utc) : 'open'}</td></tr>`).join('');
+  $('noalerts').style.display = alerts.length ? 'none' : 'block';
+}
+
+async function tick() {
+  if (!cfg) await init();
+  try {
+    const [s, h, a] = await Promise.all([
+      j(`/api/vehicles/${VID}/status`),
+      j(`/api/vehicles/${VID}/history?limit=1000`),
+      j(`/api/alerts?vehicle_id=${VID}`)]);
+    $('conn').textContent = 'API: connected';
+    render(s, h, a);
+  } catch (e) {
+    $('conn').textContent = 'API: unreachable';
+    setBadge('off', 'API OFFLINE');
+  }
+}
+
+$('reset').onclick = async () => {
+  if (!confirm('Delete all stored positions and alerts?')) return;
+  await j('/api/reset', { method: 'POST' });
+  track.setLatLngs([]); if (marker) { marker.remove(); marker = null; }
+  $('alerts').innerHTML = ''; tick();
+};
+
+$('csv').onclick = () => {
+  const cols = ['vehicle_id','timestamp_utc','received_utc','latitude','longitude','speed_kmh','sequence','source'];
+  const csv = [cols.join(',')].concat(lastHist.map(r => cols.map(c => r[c]).join(','))).join('\n');
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([csv], { type: 'text/csv' }));
+  a.download = 'positions_' + new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-') + '.csv';
+  a.click();
+};
+
+tick();
+setInterval(tick, 1000);
+</script>
+</body>
+</html>
